@@ -36,7 +36,8 @@ jobs:
           CLI_URL=$(curl -s "https://api.github.com/repos/MorpheApp/morphe-cli/releases/latest" | jq -r '.assets[] | select(.name | endswith("-all.jar")) | .browser_download_url')
           curl -sL -o morphe-cli.jar "$CLI_URL"
           
-          echo "Fetching latest Piko patches..."
+          echo "Fetching latest Piko patches (including pre-releases)..."
+          # sort_by(.published_at) | reverse | .[0] ensures we get the absolute newest by date
           PIKO_RELEASE=$(curl -s "https://api.github.com/repos/crimera/piko/releases" | jq -r 'sort_by(.published_at) | reverse | .[0]')
           PIKO_TAG=$(echo "$PIKO_RELEASE" | jq -r '.tag_name')
           MPP_URL=$(echo "$PIKO_RELEASE" | jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url')
@@ -99,7 +100,7 @@ jobs:
           INSTA_VER="${{ steps.download.outputs.version }}"
           OUTPUT="Instagram-Piko-${INSTA_VER}.apk"
           
-          # Initialize arguments array safely (removed the invalid --keystore-type flag)
+          # Initialize arguments array safely
           CMD_ARGS=(
             "java" "-jar" "morphe-cli.jar" "patch" 
             "--patches" "piko.mpp" 
@@ -135,20 +136,13 @@ jobs:
           
           echo "output_apk=$OUTPUT" >> "$GITHUB_OUTPUT"
 
-      - name: Clean Old Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Deletes the old 'latest' release so assets don't overlap
-          gh release delete latest --cleanup-tag -y || true
-
-      - name: Publish Rolling Release
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "latest"
-          name: "Instagram Auto-Build (Latest)"
+          tag_name: "${{ steps.download.outputs.version }}-${{ steps.tools.outputs.piko_tag }}"
+          name: "Instagram Auto-Build (${{ steps.tools.outputs.piko_tag }})"
           body: |
-            ## 🔄 Automated Daily Build
+            ## 🔄 Automated Build
             
             | Component | Version |
             |-----------|---------|
@@ -160,4 +154,21 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Keep Only Last 3 Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching list of releases..."
+          # Fetch all release tags sorted from newest to oldest by creation date
+          TAGS=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          
+          COUNT=0
+          for TAG in $TAGS; do
+            COUNT=$((COUNT+1))
+            if [ $COUNT -gt 3 ]; then
+              echo "Deleting old release: $TAG"
+              gh release delete "$TAG" --cleanup-tag -y || echo "Warning: Failed to delete $TAG"
+            fi
+          done
           
