@@ -1,0 +1,8 @@
+# patches.txt
+# Use '+' to explicitly include a patch.
+# Use '-' to explicitly exclude a patch.
+#
+# Examples:
+# + Disable ads
+# - Hide stories tray
+# - Hide navigation buttons
