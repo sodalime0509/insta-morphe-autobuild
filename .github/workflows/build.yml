@@ -2,7 +2,7 @@ name: Auto-Build Instagram Piko
 
 on:
   schedule:
-    - cron: "0 6 * * *" # Runs daily at 06:00 UTC just like RookieEnough
+    - cron: "0 6 * * *" # Runs daily at 06:00 UTC
   workflow_dispatch:
     inputs:
       instagram_version:
@@ -79,9 +79,16 @@ jobs:
           bash scripts/dl_uptodown.sh "$COMPAT_VER" instagram.apk
           echo "version=$COMPAT_VER" >> "$GITHUB_OUTPUT"
 
-      - name: Generate PKCS12 Keystore
+      - name: Generate BKS Keystore
         run: |
-          keytool -genkey -v -keystore keystore.p12 -storetype PKCS12 -alias piko-instagram \
+          echo "Downloading BouncyCastle Provider..."
+          curl -sL -o bcprov.jar https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.77/bcprov-jdk18on-1.77.jar
+          
+          echo "Generating BKS Keystore..."
+          keytool -genkey -v -keystore keystore.bks -storetype BKS \
+            -providerclass org.bouncycastle.jce.provider.BouncyCastleProvider \
+            -providerpath bcprov.jar \
+            -alias piko-instagram \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass pikoinstagram -keypass pikoinstagram \
             -dname "CN=Piko Instagram, OU=Build, O=Piko, C=US"
@@ -92,11 +99,11 @@ jobs:
           INSTA_VER="${{ steps.download.outputs.version }}"
           OUTPUT="Instagram-Piko-${INSTA_VER}.apk"
           
-          # Initialize arguments array safely
+          # Initialize arguments array safely (removed the invalid --keystore-type flag)
           CMD_ARGS=(
             "java" "-jar" "morphe-cli.jar" "patch" 
             "--patches" "piko.mpp" 
-            "--keystore" "keystore.p12" "--keystore-type" "PKCS12" 
+            "--keystore" "keystore.bks" 
             "--keystore-entry-alias" "piko-instagram" 
             "--keystore-password" "pikoinstagram" 
             "--keystore-entry-password" "pikoinstagram" 
