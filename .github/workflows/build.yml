@@ -1,0 +1,156 @@
+name: Auto-Build Instagram Piko
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # Runs daily at 06:00 UTC just like RookieEnough
+  workflow_dispatch:
+    inputs:
+      instagram_version:
+        description: "Force specific Instagram version (leave empty for auto-detect)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release Instagram
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Fetch Latest Morphe CLI & Piko Patches
+        id: tools
+        run: |
+          echo "Fetching Morphe CLI..."
+          CLI_URL=$(curl -s "https://api.github.com/repos/MorpheApp/morphe-cli/releases/latest" | jq -r '.assets[] | select(.name | endswith("-all.jar")) | .browser_download_url')
+          curl -sL -o morphe-cli.jar "$CLI_URL"
+          
+          echo "Fetching latest Piko patches..."
+          PIKO_RELEASE=$(curl -s "https://api.github.com/repos/crimera/piko/releases" | jq -r 'sort_by(.published_at) | reverse | .[0]')
+          PIKO_TAG=$(echo "$PIKO_RELEASE" | jq -r '.tag_name')
+          MPP_URL=$(echo "$PIKO_RELEASE" | jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url')
+          curl -sL -o piko.mpp "$MPP_URL"
+          
+          echo "piko_tag=$PIKO_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download Compatible Instagram APK
+        id: download
+        run: |
+          chmod +x scripts/dl_uptodown.sh
+          
+          if [ -n "${{ inputs.instagram_version }}" ]; then
+            COMPAT_VER="${{ inputs.instagram_version }}"
+            echo "Using forced version: $COMPAT_VER"
+          else
+            echo "Extracting compatible version from Piko..."
+            mkdir -p piko_extracted
+            unzip -q piko.mpp -d piko_extracted || true
+            
+            # Structural-agnostic JSON search
+            COMPAT_VER=$(find piko_extracted -name "*.json" -exec jq -r '.. | objects | select(has("compatiblePackages")) | .compatiblePackages[]? | select(.name == "com.instagram.android") | .versions[]?' {} + 2>/dev/null | grep -E '^[0-9]' | sort -V | tail -1 || true)
+            
+            # Auto-fallback: Scrape from dry-run log if extraction fails
+            if [ -z "$COMPAT_VER" ] || [ "$COMPAT_VER" = "null" ]; then
+               echo "Extraction failed. Performing dry-run to parse CLI logs..."
+               bash scripts/dl_uptodown.sh "latest" temp_dryrun.apk
+               java -jar morphe-cli.jar patch --patches piko.mpp temp_dryrun.apk > dryrun_log.txt 2>&1 || true
+               COMPAT_VER=$(grep -oP 'but compatible with com.instagram.android \K[0-9\.]+' dryrun_log.txt | head -1 || true)
+               rm -f temp_dryrun.apk dryrun_log.txt
+            fi
+            
+            if [ -z "$COMPAT_VER" ]; then
+              echo "::warning::All version detection failed. Defaulting to latest."
+              COMPAT_VER="latest"
+            fi
+          fi
+          
+          echo "Target Version: $COMPAT_VER"
+          bash scripts/dl_uptodown.sh "$COMPAT_VER" instagram.apk
+          echo "version=$COMPAT_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Generate PKCS12 Keystore
+        run: |
+          keytool -genkey -v -keystore keystore.p12 -storetype PKCS12 -alias piko-instagram \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass pikoinstagram -keypass pikoinstagram \
+            -dname "CN=Piko Instagram, OU=Build, O=Piko, C=US"
+
+      - name: Apply Patches (using patches.txt)
+        id: patch
+        run: |
+          INSTA_VER="${{ steps.download.outputs.version }}"
+          OUTPUT="Instagram-Piko-${INSTA_VER}.apk"
+          
+          # Initialize arguments array safely
+          CMD_ARGS=(
+            "java" "-jar" "morphe-cli.jar" "patch" 
+            "--patches" "piko.mpp" 
+            "--keystore" "keystore.p12" "--keystore-type" "PKCS12" 
+            "--keystore-entry-alias" "piko-instagram" 
+            "--keystore-password" "pikoinstagram" 
+            "--keystore-entry-password" "pikoinstagram" 
+            "--purge"
+          )
+          
+          # Parse patches.txt if it exists
+          if [ -f "patches.txt" ]; then
+            echo "Loading patch configurations from patches.txt..."
+            while IFS= read -r line || [ -n "$line" ]; do
+              # Skip empty lines and comments
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              
+              sign="${line:0:1}"
+              patch_name=$(echo "${line:1}" | xargs) # xargs trims whitespace
+              
+              if [ "$sign" = "+" ]; then
+                CMD_ARGS+=("-i" "$patch_name")
+              elif [ "$sign" = "-" ]; then
+                CMD_ARGS+=("-e" "$patch_name")
+              fi
+            done < patches.txt
+          fi
+          
+          CMD_ARGS+=("--out" "$OUTPUT" "instagram.apk")
+          
+          echo "Executing Morphe CLI..."
+          "${CMD_ARGS[@]}" || { echo "::error::Patching failed!"; exit 1; }
+          
+          echo "output_apk=$OUTPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Clean Old Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Deletes the old 'latest' release so assets don't overlap
+          gh release delete latest --cleanup-tag -y || true
+
+      - name: Publish Rolling Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "latest"
+          name: "Instagram Auto-Build (Latest)"
+          body: |
+            ## 🔄 Automated Daily Build
+            
+            | Component | Version |
+            |-----------|---------|
+            | Instagram | `${{ steps.download.outputs.version }}` |
+            | Piko Patches | `${{ steps.tools.outputs.piko_tag }}` |
+            
+            *Automatically built via GitHub Actions.*
+          files: ${{ steps.patch.outputs.output_apk }}
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
